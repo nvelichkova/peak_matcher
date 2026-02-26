@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+"""
+Dual Recording Peak Matcher - Compare peaks between two cells/recordings
+Matches peaks only within the same segment and side (e.g., a1l with a1l)
+"""
+
+import sys
+import os
+import pandas as pd
+import numpy as np
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QPushButton, QLabel, QSpinBox, 
+                             QDoubleSpinBox, QFileDialog, QTableWidget, 
+                             QTableWidgetItem, QGroupBox, QMessageBox, QTextEdit,
+                             QCheckBox, QScrollArea)
+from PyQt5.QtCore import Qt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+import re
+
+
+class DualPeakMatcherGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.df1 = None
+        self.df2 = None
+        self.matched_peaks = None
+        self.file1_name = "Cell 1"
+        self.file2_name = "Cell 2"
+        self.data_directory = None  # Store directory of loaded data files
+        self.initUI()
+        
+    def initUI(self):
+        self.setWindowTitle('Dual Recording Peak Matcher')
+        self.setGeometry(100, 100, 1500, 900)
+        
+        # Main widget and layout
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QHBoxLayout(main_widget)
+        
+        # Left panel - Controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_panel.setMaximumWidth(400)
+        
+        # File loading - Cell 1
+        file1_group = QGroupBox("Cell 1 Data")
+        file1_layout = QVBoxLayout()
+        self.load1_btn = QPushButton('Load Cell 1 Excel File')
+        self.load1_btn.clicked.connect(lambda: self.load_data(1))
+        self.file1_label = QLabel('No file loaded')
+        self.file1_label.setWordWrap(True)
+        file1_layout.addWidget(self.load1_btn)
+        file1_layout.addWidget(self.file1_label)
+        file1_group.setLayout(file1_layout)
+        left_layout.addWidget(file1_group)
+        
+        # File loading - Cell 2
+        file2_group = QGroupBox("Cell 2 Data")
+        file2_layout = QVBoxLayout()
+        self.load2_btn = QPushButton('Load Cell 2 Excel File')
+        self.load2_btn.clicked.connect(lambda: self.load_data(2))
+        self.file2_label = QLabel('No file loaded')
+        self.file2_label.setWordWrap(True)
+        file2_layout.addWidget(self.load2_btn)
+        file2_layout.addWidget(self.file2_label)
+        file2_group.setLayout(file2_layout)
+        left_layout.addWidget(file2_group)
+        
+        # Matching parameters
+        param_group = QGroupBox("Matching Parameters")
+        param_layout = QVBoxLayout()
+        
+        # Time window
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(QLabel('Time Window (±sec):'))
+        self.time_window = QDoubleSpinBox()
+        self.time_window.setRange(0.01, 10.0)
+        self.time_window.setValue(0.5)
+        self.time_window.setSingleStep(0.1)
+        self.time_window.setDecimals(2)
+        time_layout.addWidget(self.time_window)
+        param_layout.addLayout(time_layout)
+        
+        param_layout.addWidget(QLabel('Matches will be found only within\nthe same segment and side\n(e.g., a1l with a1l)'))
+        
+        # Match button
+        self.match_btn = QPushButton('Find Matching Peaks')
+        self.match_btn.clicked.connect(self.match_peaks)
+        self.match_btn.setEnabled(False)
+        param_layout.addWidget(self.match_btn)
+        
+        param_group.setLayout(param_layout)
+        left_layout.addWidget(param_group)
+        
+        # Segment overview
+        segment_group = QGroupBox("Segments Found")
+        segment_layout = QVBoxLayout()
+        self.segment_text = QTextEdit()
+        self.segment_text.setReadOnly(True)
+        self.segment_text.setMaximumHeight(100)
+        segment_layout.addWidget(self.segment_text)
+        segment_group.setLayout(segment_layout)
+        left_layout.addWidget(segment_group)
+        
+        # Segment/Side selection for plotting
+        plot_control_group = QGroupBox("Plot Control")
+        plot_control_layout = QVBoxLayout()
+        
+        # Select/Deselect all buttons
+        select_buttons_layout = QHBoxLayout()
+        self.select_all_btn = QPushButton('Select All')
+        self.select_all_btn.clicked.connect(self.select_all_segments)
+        self.deselect_all_btn = QPushButton('Deselect All')
+        self.deselect_all_btn.clicked.connect(self.deselect_all_segments)
+        select_buttons_layout.addWidget(self.select_all_btn)
+        select_buttons_layout.addWidget(self.deselect_all_btn)
+        plot_control_layout.addLayout(select_buttons_layout)
+        
+        # Scrollable area for segment checkboxes
+        plot_scroll = QScrollArea()
+        plot_scroll.setWidgetResizable(True)
+        plot_scroll.setMaximumHeight(200)
+        plot_scroll_widget = QWidget()
+        self.segment_check_layout = QVBoxLayout(plot_scroll_widget)
+        plot_scroll.setWidget(plot_scroll_widget)
+        plot_control_layout.addWidget(plot_scroll)
+        
+        self.segment_checkboxes = {}
+        
+        # Update plot button
+        self.update_plot_btn = QPushButton('Update Plot & Table')
+        self.update_plot_btn.clicked.connect(self.update_plot_and_table)
+        self.update_plot_btn.setEnabled(False)
+        plot_control_layout.addWidget(self.update_plot_btn)
+        
+        plot_control_group.setLayout(plot_control_layout)
+        left_layout.addWidget(plot_control_group)
+        
+        # Statistics
+        stats_group = QGroupBox("Statistics")
+        stats_layout = QVBoxLayout()
+        self.stats_label = QLabel('Load both files to see statistics')
+        self.stats_label.setWordWrap(True)
+        stats_layout.addWidget(self.stats_label)
+        stats_group.setLayout(stats_layout)
+        left_layout.addWidget(stats_group)
+        
+        # Export button
+        self.export_btn = QPushButton('Export Results to Excel')
+        self.export_btn.clicked.connect(self.export_results)
+        self.export_btn.setEnabled(False)
+        left_layout.addWidget(self.export_btn)
+        
+        left_layout.addStretch()
+        
+        # Right panel - Visualization and results
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        # Matplotlib figure for raster plot
+        self.figure = Figure(figsize=(11, 6))
+        self.canvas = FigureCanvas(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        right_layout.addWidget(self.toolbar)
+        right_layout.addWidget(self.canvas)
+        
+        # Results table
+        results_label = QLabel('Matched Peak Pairs (filtered by selected segments):')
+        right_layout.addWidget(results_label)
+        
+        self.results_table = QTableWidget()
+        self.results_table.setColumnCount(6)
+        self.results_table.setHorizontalHeaderLabels([
+            'Segment', 'Cell 1 Time (s)', 'Cell 2 Time (s)', 
+            'Time Diff (s)', 'Abs Diff (s)', 'Who Leads'
+        ])
+        self.results_table.horizontalHeader().setStretchLastSection(True)
+        right_layout.addWidget(self.results_table)
+        
+        # Add panels to main layout
+        layout.addWidget(left_panel)
+        layout.addWidget(right_panel, 1)
+    
+    def extract_segment_side(self, signal_name):
+        """Extract segment (e.g., 'a1') and side ('l' or 'r') from signal name"""
+        # Try to match patterns like "Mean(a1l)", "a1l", "Mean(a2r)", etc.
+        match = re.search(r'(a\d+)([lr])', signal_name.lower())
+        if match:
+            segment = match.group(1)  # e.g., 'a1'
+            side = match.group(2)      # e.g., 'l' or 'r'
+            return f"{segment}{side}"  # e.g., 'a1l'
+        return None
+    
+    def load_data(self, cell_num):
+        """Load peak data from Excel file for cell 1 or 2"""
+        filename, _ = QFileDialog.getOpenFileName(
+            self, f'Load Cell {cell_num} Peak Data', '', 'Excel Files (*.xlsx *.xls)'
+        )
+        
+        if filename:
+            try:
+                df = pd.read_excel(filename)
+                
+                # Validate required columns
+                required_cols = ['peak_time', 'signal_name']
+                if not all(col in df.columns for col in required_cols):
+                    QMessageBox.warning(
+                        self, 'Error', 
+                        f'Excel file must contain columns: {required_cols}'
+                    )
+                    return
+                
+                # Extract segment+side for each peak
+                df['segment_side'] = df['signal_name'].apply(self.extract_segment_side)
+                
+                # Remove rows where segment extraction failed
+                df = df[df['segment_side'].notna()].copy()
+                
+                if len(df) == 0:
+                    QMessageBox.warning(
+                        self, 'Error',
+                        'Could not extract segment/side info from signal names.\n'
+                        'Expected format: "Mean(a1l)", "a2r", etc.'
+                    )
+                    return
+                
+                # Store the directory path for later use in export
+                self.data_directory = os.path.dirname(filename)
+                
+                # Store data
+                if cell_num == 1:
+                    self.df1 = df
+                    self.file1_name = filename.split("/")[-1].split(".")[0][:20]
+                    self.file1_label.setText(
+                        f'Loaded: {filename.split("/")[-1]}\n'
+                        f'{len(df)} peaks from {df["segment_side"].nunique()} segments'
+                    )
+                else:
+                    self.df2 = df
+                    self.file2_name = filename.split("/")[-1].split(".")[0][:20]
+                    self.file2_label.setText(
+                        f'Loaded: {filename.split("/")[-1]}\n'
+                        f'{len(df)} peaks from {df["segment_side"].nunique()} segments'
+                    )
+                
+                # Update table headers - use simple labels
+                headers = [
+                    'Segment', 
+                    'Cell 1 Time (s)', 
+                    'Cell 2 Time (s)',
+                    'Time Diff (s)', 
+                    'Abs Diff (s)', 
+                    'Who Leads'
+                ]
+                self.results_table.setHorizontalHeaderLabels(headers)
+                
+                # Enable matching if both files loaded
+                if self.df1 is not None and self.df2 is not None:
+                    self.match_btn.setEnabled(True)
+                    self.update_segment_overview()
+                    self.plot_raster()
+                    self.update_stats()
+                
+            except Exception as e:
+                QMessageBox.critical(self, 'Error', f'Failed to load file:\n{str(e)}')
+    
+    def update_segment_overview(self):
+        """Show which segments are available in each file"""
+        if self.df1 is None or self.df2 is None:
+            return
+        
+        segments1 = set(self.df1['segment_side'].unique())
+        segments2 = set(self.df2['segment_side'].unique())
+        
+        common = segments1 & segments2
+        only1 = segments1 - segments2
+        only2 = segments2 - segments1
+        
+        text = f"Common segments (will be matched):\n"
+        text += f"  {', '.join(self.sort_segments_custom(list(common)))}\n\n"
+        
+        if only1:
+            text += f"Only in {self.file1_name}:\n"
+            text += f"  {', '.join(self.sort_segments_custom(list(only1)))}\n\n"
+        
+        if only2:
+            text += f"Only in {self.file2_name}:\n"
+            text += f"  {', '.join(self.sort_segments_custom(list(only2)))}"
+        
+        self.segment_text.setText(text)
+        
+        # Create checkboxes for all segments
+        # Clear existing checkboxes
+        for checkbox in self.segment_checkboxes.values():
+            checkbox.deleteLater()
+        self.segment_checkboxes.clear()
+        
+        # Get all unique segments from both files with custom sort
+        all_segments = self.sort_segments_custom(list(segments1 | segments2))
+        
+        # Add checkboxes for each segment
+        for segment in all_segments:
+            checkbox = QCheckBox(segment)
+            checkbox.setChecked(True)  # Default to checked
+            checkbox.stateChanged.connect(self.on_segment_selection_changed)
+            self.segment_check_layout.addWidget(checkbox)
+            self.segment_checkboxes[segment] = checkbox
+        
+        self.update_plot_btn.setEnabled(True)
+    
+    def get_selected_segments(self):
+        """Get list of selected segment names"""
+        return [name for name, checkbox in self.segment_checkboxes.items() 
+                if checkbox.isChecked()]
+    
+    def select_all_segments(self):
+        """Select all segment checkboxes"""
+        for checkbox in self.segment_checkboxes.values():
+            checkbox.setChecked(True)
+        self.update_plot_and_table()
+    
+    def deselect_all_segments(self):
+        """Deselect all segment checkboxes"""
+        for checkbox in self.segment_checkboxes.values():
+            checkbox.setChecked(False)
+        self.update_plot_and_table()
+    
+    def on_segment_selection_changed(self):
+        """Called when any segment checkbox is changed"""
+        # Could auto-update plot here if desired
+        pass
+    
+    def sort_segments_custom(self, segments):
+        """
+        Custom sort for segments: t1, t2, t3, a1, a2, ... a8, a9
+        Each with left (l) before right (r)
+        """
+        def segment_sort_key(seg):
+            # Extract segment type (t, a), number, and side (l, r)
+            import re
+            match = re.match(r'([a-z]+)(\d+)([lr]?)', seg.lower())
+            if match:
+                seg_type = match.group(1)  # 't' or 'a'
+                seg_num = int(match.group(2))  # 1, 2, 3, etc.
+                seg_side = match.group(3) if match.group(3) else ''  # 'l', 'r', or ''
+                
+                # Sort order: t comes before a, then by number, then l before r
+                type_order = {'t': 0, 'a': 1}
+                side_order = {'l': 0, 'r': 1, '': 2}
+                
+                return (type_order.get(seg_type, 99), seg_num, side_order.get(seg_side, 99))
+            else:
+                # Fallback for unrecognized format
+                return (99, 0, 99)
+        
+        return sorted(segments, key=segment_sort_key)
+    
+    def update_plot_and_table(self):
+        """Update both plot and table based on selected segments"""
+        self.plot_raster()
+        if self.matched_peaks is not None:
+            self.display_results()
+            self.update_stats()
+    
+    def plot_raster(self):
+        """Plot raster plot of all peaks from both cells"""
+        if self.df1 is None and self.df2 is None:
+            return
+        
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        
+        # Get selected segments
+        selected_segments = self.get_selected_segments()
+        
+        if not selected_segments:
+            # If nothing selected, show message
+            ax.text(0.5, 0.5, 'No segments selected\nUse checkboxes to select segments to display', 
+                   ha='center', va='center', fontsize=14, transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.canvas.draw()
+            return
+        
+        # Get all unique segments from both files, filtered by selection
+        all_segments = set()
+        if self.df1 is not None:
+            all_segments.update(self.df1['segment_side'].unique())
+        if self.df2 is not None:
+            all_segments.update(self.df2['segment_side'].unique())
+        
+        # Filter to only selected segments
+        all_segments = [seg for seg in all_segments if seg in selected_segments]
+        
+        if not all_segments:
+            ax.text(0.5, 0.5, 'No data for selected segments', 
+                   ha='center', va='center', fontsize=14, transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.canvas.draw()
+            return
+        
+        # Create y-axis mapping with custom sort order
+        # Reverse the list so a1 appears at TOP of plot (highest y-value)
+        segments = self.sort_segments_custom(all_segments)
+        segments.reverse()  # Reverse so anterior segments are at top
+        y_positions = {seg: i for i, seg in enumerate(segments)}
+        
+        # Plot Cell 1 peaks
+        if self.df1 is not None:
+            for segment in segments:
+                seg_peaks = self.df1[self.df1['segment_side'] == segment]['peak_time'].values
+                if len(seg_peaks) > 0:
+                    y_pos = [y_positions[segment] - 0.15] * len(seg_peaks)
+                    ax.plot(seg_peaks, y_pos, 'o', markersize=8, alpha=0.7, 
+                           color='blue', label='Cell 1' if segment == segments[0] else "")
+                    
+                    # Add time labels to the LEFT of each peak (slightly above)
+                    for peak_time, y in zip(seg_peaks, y_pos):
+                        ax.text(peak_time - 2.0, y + 0.05, f'{peak_time:.1f}', 
+                               fontsize=8, ha='right', va='bottom', color='blue', alpha=0.8)
+        
+        # Plot Cell 2 peaks
+        if self.df2 is not None:
+            for segment in segments:
+                seg_peaks = self.df2[self.df2['segment_side'] == segment]['peak_time'].values
+                if len(seg_peaks) > 0:
+                    y_pos = [y_positions[segment] + 0.15] * len(seg_peaks)
+                    ax.plot(seg_peaks, y_pos, 's', markersize=8, alpha=0.7, 
+                           color='red', label='Cell 2' if segment == segments[0] else "")
+                    
+                    # Add time labels to the RIGHT of each peak (slightly above)
+                    for peak_time, y in zip(seg_peaks, y_pos):
+                        ax.text(peak_time + 2.0, y + 0.05, f'{peak_time:.1f}', 
+                               fontsize=8, ha='left', va='bottom', color='red', alpha=0.8)
+        
+        # Highlight matched peaks (only for selected segments)
+        if self.matched_peaks is not None:
+            for match in self.matched_peaks:
+                segment = match['segment']
+                if segment in y_positions:  # Only if segment is selected
+                    time1 = match['time1']
+                    time2 = match['time2']
+                    y1 = y_positions[segment] - 0.15  # Cell 1 position
+                    y2 = y_positions[segment] + 0.15  # Cell 2 position
+                    
+                    # Check if peaks are simultaneous (within 0.1 seconds)
+                    time_diff = abs(time2 - time1)
+                    
+                    if time_diff < 0.1:
+                        # Simultaneous peaks: draw dashed line (no arrow)
+                        ax.plot([time1, time2], [y1, y2], 
+                               linestyle='--', linewidth=2, color='green', alpha=0.6)
+                    else:
+                        # Non-simultaneous: draw arrow from earlier to later
+                        if time1 < time2:
+                            # Cell 1 peak is earlier, arrow points from Cell 1 to Cell 2
+                            start_x, start_y = time1, y1
+                            end_x, end_y = time2, y2
+                        else:
+                            # Cell 2 peak is earlier, arrow points from Cell 2 to Cell 1
+                            start_x, start_y = time2, y2
+                            end_x, end_y = time1, y1
+                        
+                        # Draw arrow from earlier to later peak
+                        ax.annotate('', xy=(end_x, end_y), xytext=(start_x, start_y),
+                                   arrowprops=dict(arrowstyle='->', lw=2, color='green', alpha=0.6))
+                    
+                    # Highlight matched peaks with green circles
+                    ax.plot(match['time1'], y_positions[segment] - 0.15, 'go', 
+                           markersize=12, fillstyle='none', linewidth=2)
+                    ax.plot(match['time2'], y_positions[segment] + 0.15, 'go', 
+                           markersize=12, fillstyle='none', linewidth=2)
+        
+        ax.set_yticks(range(len(segments)))
+        ax.set_yticklabels(segments)
+        ax.set_xlabel('Time (seconds)', fontsize=12)
+        ax.set_ylabel('Segment+Side', fontsize=12)
+        ax.set_title('Peak Raster Plot: Cell 1 (blue circles) vs Cell 2 (red squares)', 
+                    fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='x')
+        ax.legend(loc='upper right')
+        
+        self.figure.tight_layout()
+        self.canvas.draw()
+    
+    def match_peaks(self):
+        """Find matching peaks between the two cells within each segment"""
+        if self.df1 is None or self.df2 is None:
+            return
+        
+        time_window = self.time_window.value()
+        
+        # Find common segments
+        segments1 = set(self.df1['segment_side'].unique())
+        segments2 = set(self.df2['segment_side'].unique())
+        common_segments = segments1 & segments2
+        
+        if not common_segments:
+            QMessageBox.warning(
+                self, 'Warning',
+                'No common segments found between the two files!'
+            )
+            return
+        
+        # Match peaks within each segment
+        matched_pairs = []
+        
+        for segment in self.sort_segments_custom(list(common_segments)):
+            # Get peaks for this segment from both cells
+            peaks1 = self.df1[self.df1['segment_side'] == segment]['peak_time'].values
+            peaks2 = self.df2[self.df2['segment_side'] == segment]['peak_time'].values
+            
+            # Find all pairs within time window
+            used_indices2 = set()
+            
+            for t1 in peaks1:
+                # Find closest peak in cell 2 within time window
+                candidates = []
+                for idx2, t2 in enumerate(peaks2):
+                    if idx2 not in used_indices2:
+                        time_diff = abs(t2 - t1)
+                        if time_diff <= time_window:
+                            candidates.append((idx2, t2, time_diff))
+                
+                # If we found candidates, take the closest one
+                if candidates:
+                    # Sort by time difference
+                    candidates.sort(key=lambda x: x[2])
+                    idx2, t2, diff = candidates[0]
+                    
+                    matched_pairs.append({
+                        'segment': segment,
+                        'time1': t1,
+                        'time2': t2,
+                        'time_diff': t2 - t1,  # Positive = cell 2 leads
+                        'abs_diff': abs(t2 - t1)
+                    })
+                    
+                    used_indices2.add(idx2)
+        
+        self.matched_peaks = matched_pairs
+        
+        # Update display
+        self.update_plot_and_table()
+        self.export_btn.setEnabled(True)
+    
+    def display_results(self):
+        """Display matched peaks in the results table"""
+        if self.matched_peaks is None:
+            return
+        
+        # Filter matches by selected segments
+        selected_segments = self.get_selected_segments()
+        filtered_matches = [m for m in self.matched_peaks 
+                           if m['segment'] in selected_segments]
+        
+        self.results_table.setRowCount(len(filtered_matches))
+        
+        for i, match in enumerate(filtered_matches):
+            # Segment
+            self.results_table.setItem(i, 0, QTableWidgetItem(match['segment']))
+            
+            # Cell 1 time
+            self.results_table.setItem(i, 1, 
+                QTableWidgetItem(f"{match['time1']:.2f}"))
+            
+            # Cell 2 time
+            self.results_table.setItem(i, 2, 
+                QTableWidgetItem(f"{match['time2']:.2f}"))
+            
+            # Time difference (signed)
+            diff = match['time_diff']
+            self.results_table.setItem(i, 3, 
+                QTableWidgetItem(f"{diff:+.3f}"))
+            
+            # Absolute difference
+            self.results_table.setItem(i, 4, 
+                QTableWidgetItem(f"{match['abs_diff']:.3f}"))
+            
+            # Who leads
+            if diff > 0:
+                leader = "Cell 2 leads"
+            elif diff < 0:
+                leader = "Cell 1 leads"
+            else:
+                leader = "Simultaneous"
+            self.results_table.setItem(i, 5, QTableWidgetItem(leader))
+        
+        self.results_table.resizeColumnsToContents()
+    
+    def update_stats(self):
+        """Update statistics display"""
+        if self.df1 is None or self.df2 is None:
+            return
+        
+        # Get selected segments
+        selected_segments = self.get_selected_segments()
+        
+        # Filter data by selected segments
+        df1_selected = self.df1[self.df1['segment_side'].isin(selected_segments)] if selected_segments else self.df1
+        df2_selected = self.df2[self.df2['segment_side'].isin(selected_segments)] if selected_segments else self.df2
+        
+        stats_text = "Cell 1:\n"
+        stats_text += f"  Total: {len(self.df1)} peaks, {self.df1['segment_side'].nunique()} segments\n"
+        stats_text += f"  Selected: {len(df1_selected)} peaks, {len(selected_segments)} segments\n\n"
+        
+        stats_text += "Cell 2:\n"
+        stats_text += f"  Total: {len(self.df2)} peaks, {self.df2['segment_side'].nunique()} segments\n"
+        stats_text += f"  Selected: {len(df2_selected)} peaks, {len(selected_segments)} segments\n\n"
+        
+        if self.matched_peaks is not None:
+            # Filter matches by selected segments
+            filtered_matches = [m for m in self.matched_peaks 
+                               if m['segment'] in selected_segments]
+            
+            stats_text += f"Matched pairs (all): {len(self.matched_peaks)}\n"
+            stats_text += f"Matched pairs (selected): {len(filtered_matches)}\n\n"
+            
+            if filtered_matches:
+                # Calculate statistics on filtered matches
+                diffs = [m['time_diff'] for m in filtered_matches]
+                abs_diffs = [m['abs_diff'] for m in filtered_matches]
+                
+                mean_diff = np.mean(diffs)
+                std_diff = np.std(diffs)
+                mean_abs_diff = np.mean(abs_diffs)
+                
+                stats_text += f"Mean time diff: {mean_diff:+.3f} s\n"
+                stats_text += f"Std dev: ±{std_diff:.3f} s\n"
+                stats_text += f"Mean abs diff: {mean_abs_diff:.3f} s\n\n"
+                
+                # Count who leads more often
+                cell1_leads = sum(1 for d in diffs if d < 0)
+                cell2_leads = sum(1 for d in diffs if d > 0)
+                simultaneous = sum(1 for d in diffs if d == 0)
+                
+                stats_text += "Cell 1 leads: " + str(cell1_leads) + "\n"
+                stats_text += "Cell 2 leads: " + str(cell2_leads) + "\n"
+                if simultaneous > 0:
+                    stats_text += f"Simultaneous: {simultaneous}"
+        
+        self.stats_label.setText(stats_text)
+    
+    def export_results(self):
+        """Export matched peaks to Excel"""
+        if self.matched_peaks is None:
+            QMessageBox.warning(self, 'Warning', 'No results to export')
+            return
+        
+        # Ask user if they want to export all or only selected segments
+        selected_segments = self.get_selected_segments()
+        all_segments = set(m['segment'] for m in self.matched_peaks)
+        
+        if len(selected_segments) < len(all_segments):
+            reply = QMessageBox.question(
+                self, 'Export Options',
+                f'You have {len(selected_segments)} segments selected out of {len(all_segments)} total.\n\n'
+                f'Do you want to export only the selected segments?\n\n'
+                f'Click "Yes" to export selected segments only.\n'
+                f'Click "No" to export all segments.',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            export_only_selected = (reply == QMessageBox.Yes)
+        else:
+            export_only_selected = False
+        
+        # Use the data directory as default save location
+        if self.data_directory:
+            default_filename = os.path.join(self.data_directory, 'dual_peak_matching_results.xlsx')
+        else:
+            default_filename = 'dual_peak_matching_results.xlsx'
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self, 'Export Results', default_filename, 
+            'Excel Files (*.xlsx)'
+        )
+        
+        if filename:
+            try:
+                # Filter matches if requested
+                if export_only_selected:
+                    matches_to_export = [m for m in self.matched_peaks 
+                                        if m['segment'] in selected_segments]
+                else:
+                    matches_to_export = self.matched_peaks
+                
+                # Create results dataframe
+                results_data = []
+                for match in matches_to_export:
+                    # Determine who leads
+                    diff = match['time_diff']
+                    if diff > 0:
+                        leader = f"{self.file2_name} leads"
+                    elif diff < 0:
+                        leader = f"{self.file1_name} leads"
+                    else:
+                        leader = "Simultaneous"
+                    
+                    results_data.append({
+                        'Segment': match['segment'],
+                        'Cell_1_Time_sec': match['time1'],
+                        'Cell_2_Time_sec': match['time2'],
+                        'Time_Diff_sec': match['time_diff'],
+                        'Abs_Diff_sec': match['abs_diff'],
+                        'Who_Leads': leader,
+                        'Cell_1_Leads': match['time_diff'] < 0,
+                        'Cell_2_Leads': match['time_diff'] > 0
+                    })
+                
+                df_results = pd.DataFrame(results_data)
+                
+                # Add metadata sheet
+                metadata = {
+                    'Field': ['Cell_1_Name', 'Cell_2_Name', 'Time_Window_sec', 
+                             'Total_Segments', 'Exported_Segments', 'Total_Matches', 'Exported_Matches'],
+                    'Value': [self.file1_name, self.file2_name, self.time_window.value(),
+                             len(all_segments), len(selected_segments) if export_only_selected else len(all_segments),
+                             len(self.matched_peaks), len(matches_to_export)]
+                }
+                df_metadata = pd.DataFrame(metadata)
+                
+                # Calculate summary by segment
+                summary_data = []
+                for segment in self.sort_segments_custom(list(df_results['Segment'].unique())):
+                    seg_data = df_results[df_results['Segment'] == segment]
+                    summary_data.append({
+                        'Segment': segment,
+                        'N_Matches': len(seg_data),
+                        'Mean_Time_Diff_sec': seg_data['Time_Diff_sec'].mean(),
+                        'Std_Time_Diff_sec': seg_data['Time_Diff_sec'].std(),
+                        'Mean_Abs_Diff_sec': seg_data['Abs_Diff_sec'].mean(),
+                        'Cell_1_Leads_Count': seg_data['Cell_1_Leads'].sum(),
+                        'Cell_2_Leads_Count': seg_data['Cell_2_Leads'].sum()
+                    })
+                
+                df_summary = pd.DataFrame(summary_data)
+                
+                # Write to Excel with multiple sheets
+                with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                    # Metadata sheet first
+                    df_metadata.to_excel(writer, sheet_name='Metadata', index=False)
+                    
+                    # All matches
+                    df_results.to_excel(writer, sheet_name='All_Matches', index=False)
+                    
+                    # Summary by segment
+                    df_summary.to_excel(writer, sheet_name='Summary_by_Segment', index=False)
+                
+                QMessageBox.information(self, 'Success', 
+                                      f'Results exported to:\n{filename}\n\n'
+                                      f'Sheets created:\n'
+                                      f'• Metadata - File info and parameters\n'
+                                      f'• All_Matches - Individual peak pairs\n'
+                                      f'• Summary_by_Segment - Statistics per segment')
+                
+            except Exception as e:
+                QMessageBox.critical(self, 'Error', 
+                                   f'Failed to export results:\n{str(e)}')
+
+
+def main():
+    app = QApplication(sys.argv)
+    gui = DualPeakMatcherGUI()
+    gui.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
